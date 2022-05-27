@@ -14,6 +14,7 @@
 # limitations under the License.
 #
 
+ifneq ($(filter s4 t7,$(TARGET_AMLOGIC_SOC)),)
 LOCAL_PATH := $(call my-dir)
 
 ifeq ($(TARGET_PREBUILT_KERNEL),)
@@ -67,4 +68,5 @@ $(_media_ko): $(KERNEL_OUT)/arch/$(KERNEL_ARCH)/boot/$(BOARD_KERNEL_IMAGE_NAME)
 	touch $(_media_intermediates)/media.ko
 
 include $(BUILD_SYSTEM)/base_rules.mk
+endif
 endif
