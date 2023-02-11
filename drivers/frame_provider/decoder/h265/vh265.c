@@ -3913,7 +3913,7 @@ static void init_decode_head_hw(struct hevc_state_s *hevc)
 {
 
 	struct BuffInfo_s *buf_spec = hevc->work_space_buf;
-	unsigned int data32;
+	unsigned int data32 = 0;
 
 	int losless_comp_header_size =
 		compute_losless_comp_header_size(hevc->pic_w,

@@ -31,6 +31,7 @@ typedef unsigned short int	u16;
 typedef short int		s16;
 typedef unsigned char		u8;
 */
+
 #define CODEC_MODE(a, b, c, d)\
 	(((u8)(a) << 24) | ((u8)(b) << 16) | ((u8)(c) << 8) | (u8)(d))
 
