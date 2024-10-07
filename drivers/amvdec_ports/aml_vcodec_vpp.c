@@ -27,6 +27,7 @@
 #include "aml_vcodec_adapt.h"
 #include "vdec_drv_if.h"
 #include "../common/chips/decoder_cpu_ver_info.h"
+#include "utils/common.h"
 
 #define KERNEL_ATRACE_TAG KERNEL_ATRACE_TAG_V4L2
 #include <trace/events/meson_atrace.h>
@@ -37,6 +38,7 @@
 
 extern int dump_vpp_input;
 extern int vpp_bypass_frames;
+extern char dump_path[32];
 
 static void di_release_keep_buf_wrap(void *arg)
 {
@@ -213,6 +215,7 @@ static enum DI_ERRORTYPE
 		vpp_buf->di_local_buf = buf;
 		vpp_buf->di_buf.vf->vf_ext = buf->vf;
 		vpp_buf->di_buf.vf->flag |= VFRAME_FLAG_CONTAIN_POST_FRAME;
+		atomic_set(&vpp->local_buf_out, 1);
 	}
 
 	kfifo_put(&vpp->out_done_q, vpp_buf);
@@ -575,7 +578,8 @@ static bool can_vpp_get_buf_from_m2m(struct aml_v4l2_vpp* vpp)
 	struct aml_vcodec_ctx *ctx = vpp->ctx;
 
 	if (ctx->cap_pool.dec >= (ctx->dpb_size - 1) ||
-		ctx->cap_pool.vpp < aml_v4l2_vpp_get_buf_num(ctx->vpp_cfg.mode))
+		(ctx->cap_pool.vpp < aml_v4l2_vpp_get_buf_num(ctx->vpp_cfg.mode)) ||
+		vpp->get_eos)
 		return true;
 
 	v4l_dbg(ctx, V4L_DEBUG_VPP_BUFMGR, "%s dec: %d dpb_size: %d vpp: %d\n",
@@ -695,9 +699,6 @@ retry:
 			else
 				vf_out->canvas0_config[1].phy_addr =
 					fb->m.mem[1].addr;
-
-			if (in_buf->di_buf.flag & DI_FLAG_EOS)
-				memset(vf_out, 0, sizeof(*vf_out));
 
 			vf_out->meta_data_size = in_buf->di_buf.vf->meta_data_size;
 			vf_out->meta_data_buf = in_buf->di_buf.vf->meta_data_buf;
@@ -830,10 +831,12 @@ int aml_v4l2_vpp_reset(struct aml_v4l2_vpp *vpp)
 	struct sched_param param =
 		{ .sched_priority = MAX_RT_PRIO - 1 };
 
-	vpp->running = false;
-	up(&vpp->sem_in);
-	up(&vpp->sem_out);
-	kthread_stop(vpp->task);
+	if (vpp->running) {
+		vpp->running = false;
+		up(&vpp->sem_in);
+		up(&vpp->sem_out);
+		kthread_stop(vpp->task);
+	}
 
 	kfifo_reset(&vpp->input);
 	kfifo_reset(&vpp->output);
@@ -861,6 +864,7 @@ int aml_v4l2_vpp_reset(struct aml_v4l2_vpp *vpp)
 	vpp->out_num[0]	= 0;
 	vpp->out_num[1]	= 0;
 	vpp->fb_token	= 0;
+	vpp->get_eos = false;
 	sema_init(&vpp->sem_in, 0);
 	sema_init(&vpp->sem_out, 0);
 
@@ -1038,6 +1042,7 @@ int aml_v4l2_vpp_init(
 	mutex_init(&vpp->output_lock);
 	sema_init(&vpp->sem_in, 0);
 	sema_init(&vpp->sem_out, 0);
+	atomic_set(&vpp->local_buf_out, 0);
 
 	vpp->running = true;
 	vpp->task = kthread_run(aml_v4l2_vpp_thread, vpp,
@@ -1095,11 +1100,14 @@ int aml_v4l2_vpp_destroy(struct aml_v4l2_vpp* vpp)
 {
 	v4l_dbg(vpp->ctx, V4L_DEBUG_VPP_DETAIL,
 		"vpp destroy begin\n");
-	vpp->running = false;
-	up(&vpp->sem_in);
-	up(&vpp->sem_out);
-	kthread_stop(vpp->task);
+	atomic_set(&vpp->local_buf_out, 0);
 
+	if (vpp->running) {
+		vpp->running = false;
+		up(&vpp->sem_in);
+		up(&vpp->sem_out);
+		kthread_stop(vpp->task);
+	}
 	di_destroy_instance(vpp->di_handle);
 	/* no more vpp callback below this line */
 
@@ -1121,6 +1129,25 @@ int aml_v4l2_vpp_destroy(struct aml_v4l2_vpp* vpp)
 	return 0;
 }
 EXPORT_SYMBOL(aml_v4l2_vpp_destroy);
+
+int aml_v4l2_vpp_thread_stop(struct aml_v4l2_vpp* vpp)
+{
+	v4l_dbg(vpp->ctx, V4L_DEBUG_VPP_DETAIL,
+		"vpp thread stop begin\n");
+
+	if (vpp->running) {
+		vpp->running = false;
+		up(&vpp->sem_in);
+		up(&vpp->sem_out);
+		kthread_stop(vpp->task);
+	}
+
+	v4l_dbg(vpp->ctx, V4L_DEBUG_VPP_DETAIL,
+		"vpp thread stop done\n");
+
+	return 0;
+}
+EXPORT_SYMBOL(aml_v4l2_vpp_thread_stop);
 
 static int aml_v4l2_vpp_push_vframe(struct aml_v4l2_vpp* vpp, struct vframe_s *vf)
 {
@@ -1149,6 +1176,7 @@ static int aml_v4l2_vpp_push_vframe(struct aml_v4l2_vpp* vpp, struct vframe_s *v
 		u32 dw_mode = VDEC_DW_NO_AFBC;
 
 		in_buf->di_buf.flag |= DI_FLAG_EOS;
+		vpp->get_eos = true;
 
 		if (vdec_if_get_param(vpp->ctx, GET_PARAM_DW_MODE, &dw_mode))
 			return -1;
@@ -1190,7 +1218,7 @@ static int aml_v4l2_vpp_push_vframe(struct aml_v4l2_vpp* vpp, struct vframe_s *v
 	do {
 		unsigned int dw_mode = VDEC_DW_NO_AFBC;
 		struct file *fp;
-
+		char file_name[64] = {0};
 		if (!dump_vpp_input || vpp->ctx->is_drm_mode)
 			break;
 		if (vdec_if_get_param(vpp->ctx, GET_PARAM_DW_MODE, &dw_mode))
@@ -1198,15 +1226,27 @@ static int aml_v4l2_vpp_push_vframe(struct aml_v4l2_vpp* vpp, struct vframe_s *v
 		if (dw_mode == VDEC_DW_AFBC_ONLY)
 			break;
 
-		fp = filp_open("/data/dec_dump_before.raw",
-				O_CREAT | O_RDWR | O_LARGEFILE | O_APPEND, 0600);
+		snprintf(file_name, 64, "%s/dec_dump_vpp_input_%ux%u.raw", dump_path, vf->width, vf->height);
+		fp = filp_open(file_name, O_CREAT | O_RDWR | O_LARGEFILE | O_APPEND, 0600);
 		if (!IS_ERR(fp)) {
 			struct vb2_buffer *vb = &in_buf->aml_buf->vb.vb2_buf;
 
-			kernel_write(fp,vb2_plane_vaddr(vb, 0),vb->planes[0].length, 0);
-			if (in_buf->aml_buf->frame_buffer.num_planes == 2)
-				kernel_write(fp,vb2_plane_vaddr(vb, 1),
-						vb->planes[1].length, 0);
+			// dump y data
+			u8 *yuv_data_addr = aml_yuv_dump(fp, (u8 *)vb2_plane_vaddr(vb, 0),
+				vf->width, vf->height, 64);
+
+			// dump uv data
+			if (in_buf->aml_buf->frame_buffer.num_planes == 1) {
+				aml_yuv_dump(fp, yuv_data_addr, vf->width,
+					vf->height / 2, 64);
+			} else {
+				aml_yuv_dump(fp, (u8 *)vb2_plane_vaddr(vb, 1),
+					vf->width, vf->height / 2, 64);
+			}
+
+			pr_info("dump idx: %d %dx%d num_planes %d\n", dump_vpp_input,
+				vf->width, vf->height, in_buf->aml_buf->frame_buffer.num_planes);
+
 			dump_vpp_input--;
 			filp_close(fp, NULL);
 		}

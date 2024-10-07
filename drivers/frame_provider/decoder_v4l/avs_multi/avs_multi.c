@@ -53,6 +53,7 @@
 #include "../../decoder/utils/config_parser.h"
 #include "../../decoder/utils/vdec_v4l2_buffer_ops.h"
 #include "avs_multi.h"
+#include "../../decoder/utils/decoder_dma_alloc.h"
 
 #define DEBUG_MULTI_FLAG  0
 
@@ -290,6 +291,7 @@ dma_addr_t es_write_addr_phy;
 
 void *bitstream_read_tmp;
 dma_addr_t bitstream_read_tmp_phy;
+ulong bitstream_read_handle;
 void *avsp_heap_adr;
 static uint long_cabac_busy;
 #endif
@@ -534,6 +536,10 @@ struct vdec_avs_hw_s {
 	struct vframe_s vframe_dummy;
 	ulong fb_token;
 	u32 canvas_mode;
+	ulong user_data_handle;
+	ulong lmem_phy_handle;
+	bool process_busy;
+	bool run_flag;
 };
 
 static void reset_process_time(struct vdec_avs_hw_s *hw);
@@ -1727,6 +1733,27 @@ static int vavs_prot_init(struct vdec_avs_hw_s *hw)
 #endif
 		} else
 			vavs_restore_regs(hw);
+
+		for (i = 0; i < hw->vf_buf_num_used; i++) {
+			if (hw->canvas_config[i][0].phy_addr &&
+				hw->canvas_config[i][1].phy_addr) {
+				config_cav_lut_ex(canvas_y(hw->canvas_spec[i]),
+					hw->canvas_config[i][0].phy_addr,
+					hw->canvas_config[i][0].width,
+					hw->canvas_config[i][0].height,
+					CANVAS_ADDR_NOWRAP,
+					hw->canvas_config[i][0].block_mode,
+					hw->canvas_config[i][0].endian, VDEC_1);
+
+				config_cav_lut_ex(canvas_u(hw->canvas_spec[i]),
+					hw->canvas_config[i][1].phy_addr,
+					hw->canvas_config[i][1].width,
+					hw->canvas_config[i][1].height,
+					CANVAS_ADDR_NOWRAP,
+					hw->canvas_config[i][1].block_mode,
+					hw->canvas_config[i][1].endian, VDEC_1);
+			}
+		}
 	}
 	/* notify ucode the buffer offset */
 	if (hw->decode_pic_count == 0)
@@ -1840,6 +1867,7 @@ static void vavs_local_init(struct vdec_avs_hw_s *hw)
 	hw->total_frame = 0;
 	hw->saved_resolution = 0;
 	hw->next_pts = 0;
+	hw->process_busy = false;
 
 #ifdef DEBUG_PTS
 	hw->pts_hit = hw->pts_missed = hw->pts_i_hit = hw->pts_i_missed = 0;
@@ -2121,9 +2149,9 @@ static void init_avsp_long_cabac_buf(void)
 
 #ifdef BITSTREAM_READ_TMP_NO_CACHE
 	bitstream_read_tmp =
-		(void *)dma_alloc_coherent(amports_get_dma_device(),
+		(void *)decoder_dma_alloc_coherent(&bitstream_read_handle,
 			SVA_STREAM_BUF_SIZE, &bitstream_read_tmp_phy,
-			 GFP_KERNEL);
+			"AVS_BITSTREAM_BUF");
 
 #else
 	bitstream_read_tmp = kmalloc(SVA_STREAM_BUF_SIZE, GFP_KERNEL);
@@ -2331,9 +2359,9 @@ static int amvdec_avs_probe(struct platform_device *pdev)
 #ifdef ENABLE_USER_DATA
 	if (NULL == hw->user_data_buffer) {
 		hw->user_data_buffer =
-			dma_alloc_coherent(amports_get_dma_device(),
+			decoder_dma_alloc_coherent(&hw->user_data_handle,
 				USER_DATA_SIZE,
-				&hw->user_data_buffer_phys, GFP_KERNEL);
+				&hw->user_data_buffer_phys, "AVS_AUX_BUF");
 		if (!hw->user_data_buffer) {
 			pr_info("%s: Can not allocate hw->user_data_buffer\n",
 				   __func__);
@@ -2405,7 +2433,7 @@ static int amvdec_avs_remove(struct platform_device *pdev)
 
 #ifdef BITSTREAM_READ_TMP_NO_CACHE
 		if (bitstream_read_tmp) {
-			dma_free_coherent(amports_get_dma_device(),
+			decoder_dma_free_coherent(bitstream_read_handle,
 				SVA_STREAM_BUF_SIZE, bitstream_read_tmp,
 				bitstream_read_tmp_phy);
 			bitstream_read_tmp = NULL;
@@ -2429,8 +2457,8 @@ static int amvdec_avs_remove(struct platform_device *pdev)
 
 #ifdef ENABLE_USER_DATA
 	if (hw->user_data_buffer != NULL) {
-		dma_free_coherent(
-			amports_get_dma_device(),
+		decoder_dma_free_coherent(
+			hw->user_data_handle,
 			USER_DATA_SIZE,
 			hw->user_data_buffer,
 			hw->user_data_buffer_phys);
@@ -2733,6 +2761,17 @@ static void timeout_process(struct vdec_avs_hw_s *hw)
 {
 	struct vdec_s *vdec = hw_to_vdec(hw);
 	struct aml_vcodec_ctx *ctx = hw->v4l2_ctx;
+
+	if (hw->process_busy) {
+		pr_info("%s, process busy\n", __func__);
+		return;
+	}
+	if (work_pending(&hw->work) ||
+		work_busy(&hw->work)) {
+		pr_err("avs multi work on busy\n");
+		return;
+	}
+
 	amvdec_stop();
 	if (error_handle_policy & 0x1) {
 		handle_decoding_error(hw);
@@ -2978,6 +3017,7 @@ void (*callback)(struct vdec_s *, void *),
 	int size, ret;
 	int i;
 	struct aml_vcodec_ctx *ctx = hw->v4l2_ctx;
+	hw->run_flag = 1;
 
 	if (!hw->vdec_pg_enable_flag) {
 		hw->vdec_pg_enable_flag = 1;
@@ -3017,6 +3057,7 @@ void (*callback)(struct vdec_s *, void *),
 			hw->input_empty++;
 			hw->dec_result = DEC_RESULT_AGAIN;
 			vdec_schedule_work(&hw->work);
+			hw->run_flag = 0;
 			return;
 		}
 	} else {
@@ -3024,6 +3065,7 @@ void (*callback)(struct vdec_s *, void *),
 			hw->input_empty++;
 			hw->dec_result = DEC_RESULT_AGAIN;
 			vdec_schedule_work(&hw->work);
+			hw->run_flag = 0;
 			return;
 		}
 	}
@@ -3104,6 +3146,7 @@ void (*callback)(struct vdec_s *, void *),
 			hw->dec_result = DEC_RESULT_FORCE_EXIT;
 			vdec_v4l_post_error_event(ctx, DECODER_EMERGENCY_FW_LOAD_ERROR);
 			vdec_schedule_work(&hw->work);
+			hw->run_flag = 0;
 			return;
 		}
 		vdec->mc_loaded = 1;
@@ -3126,6 +3169,7 @@ void (*callback)(struct vdec_s *, void *),
 		debug_print(hw, PRINT_FLAG_ERROR,
 		"ammvdec_avs: error HW context restore\n");
 		vdec_schedule_work(&hw->work);
+		hw->run_flag = 0;
 		return;
 	}
 
@@ -3183,6 +3227,7 @@ void (*callback)(struct vdec_s *, void *),
 	hw->stat |= STAT_TIMER_ARM;
 
 	mod_timer(&hw->check_timer, jiffies + CHECK_INTERVAL);
+	hw->run_flag = 0;
 }
 
 static void reset(struct vdec_s *vdec)
@@ -3278,7 +3323,7 @@ static int prepare_display_buf(struct vdec_avs_hw_s *hw,
 			(v4l2_ctx->cap_pix_fmt == V4L2_PIX_FMT_NV12M))
 			nv_order = VIDTYPE_VIU_NV12;
 
-	if (hw->interlace_flag) {	/* interlace */
+	if (hw->interlace_flag && (v4l2_ctx->vpp_is_need)) {	/* interlace */
 		hw->throw_pb_flag = 0;
 
 		debug_print(hw, PRINT_FLAG_VFRAME_DETAIL,
@@ -3718,7 +3763,7 @@ static int v4l_res_change(struct vdec_avs_hw_s *hw)
 	return ret;
 }
 
-static irqreturn_t vmavs_isr_thread_fn(struct vdec_s *vdec, int irq)
+static irqreturn_t vmavs_isr_thread_handler(struct vdec_s *vdec, int irq)
 {
 		struct vdec_avs_hw_s *hw =
 			(struct vdec_avs_hw_s *)vdec->private;
@@ -4029,8 +4074,29 @@ static irqreturn_t vmavs_isr_thread_fn(struct vdec_s *vdec, int irq)
 #endif
 }
 
+static irqreturn_t vmavs_isr_thread_fn(struct vdec_s *vdec, int irq)
+{
+	irqreturn_t ret;
+	struct vdec_avs_hw_s *hw =
+		(struct vdec_avs_hw_s *)vdec->private;
+
+	ret = vmavs_isr_thread_handler(vdec, irq);
+
+	hw->process_busy = false;
+
+	return ret;
+}
+
 static irqreturn_t vmavs_isr(struct vdec_s *vdec, int irq)
 {
+	struct vdec_avs_hw_s *hw =
+		(struct vdec_avs_hw_s *)vdec->private;
+
+	if (hw->process_busy) {
+		pr_info("%s, process busy\n", __func__);
+		return IRQ_HANDLED;
+	}
+	hw->process_busy = true;
 
 	WRITE_VREG(ASSIST_MBOX1_CLR_REG, 1);
 
@@ -4052,7 +4118,10 @@ static void vmavs_dump_state(struct vdec_s *vdec)
 		hw->frame_dur);
 
 	debug_print(hw, 0,
-		"is_framebase(%d), decode_status 0x%x, buf_status 0x%x, buf_recycle_status 0x%x, throw %d, eos %d, state 0x%x, dec_result 0x%x dec_frm %d disp_frm %d run %d not_run_ready %d input_empty %d\n",
+		"is_framebase(%d), decode_status 0x%x, buf_status 0x%x,"
+		"buf_recycle_status 0x%x, throw %d, eos %d, state 0x%x,"
+		"dec_result 0x%x dec_frm %d disp_frm %d run %d"
+		"not_run_ready %d input_empty %d run_flag %d\n",
 		vdec_frame_based(vdec),
 		READ_VREG(DECODE_STATUS) & 0xff,
 		hw->buf_status,
@@ -4065,7 +4134,9 @@ static void vmavs_dump_state(struct vdec_s *vdec)
 		hw->display_frame_count,
 		hw->run_count,
 		hw->not_run_ready,
-		hw->input_empty);
+		hw->input_empty,
+		hw->run_flag
+		);
 
 	debug_print(hw, 0,
 		"%s, newq(%d/%d), dispq(%d/%d)recycleq(%d/%d) drop %d vf peek %d, prepare/get/put (%d/%d/%d)\n",
@@ -4239,9 +4310,9 @@ static void vmavs_dump_state(struct vdec_s *vdec)
 #ifdef ENABLE_USER_DATA
 	if (NULL == hw->user_data_buffer) {
 		hw->user_data_buffer =
-			dma_alloc_coherent(amports_get_dma_device(),
+			decoder_dma_alloc_coherent(&hw->user_data_handle,
 				USER_DATA_SIZE,
-				&hw->user_data_buffer_phys, GFP_KERNEL);
+				&hw->user_data_buffer_phys, "AVS_AUX_BUF");
 		if (!hw->user_data_buffer) {
 			pr_info("%s: Can not allocate hw->user_data_buffer\n",
 				   __func__);
@@ -4253,8 +4324,8 @@ static void vmavs_dump_state(struct vdec_s *vdec)
 	}
 #endif
 
-	hw->lmem_addr = (dma_addr_t)dma_alloc_coherent(amports_get_dma_device(),
-	               LMEM_BUF_SIZE, (dma_addr_t *)&hw->lmem_phy_addr, GFP_KERNEL);
+	hw->lmem_addr = (dma_addr_t)decoder_dma_alloc_coherent(&hw->lmem_phy_handle,
+	               LMEM_BUF_SIZE, (dma_addr_t *)&hw->lmem_phy_addr, "AVS_LMEM_BUF");
 	if (hw->lmem_addr == 0) {
 		pr_err("%s: failed to alloc lmem buffer\n", __func__);
 		r = -1;
@@ -4319,12 +4390,12 @@ static void vmavs_dump_state(struct vdec_s *vdec)
 
 	return 0;
 error4:
-	dma_free_coherent(amports_get_dma_device(),
+	decoder_dma_free_coherent(hw->lmem_phy_handle,
 		LMEM_BUF_SIZE, (void *)hw->lmem_addr,
 		hw->lmem_phy_addr);
 error3:
-	dma_free_coherent(
-		amports_get_dma_device(),
+	decoder_dma_free_coherent(
+		hw->user_data_handle,
 		USER_DATA_SIZE,
 		hw->user_data_buffer,
 		hw->user_data_buffer_phys);
@@ -4367,8 +4438,12 @@ error1:
 		cancel_work_sync(&hw->work);
 
 		if (hw->mm_blk_handle) {
-			decoder_bmmu_box_free(hw->mm_blk_handle);
+			void *bmmu_box_tmp = hw->mm_blk_handle;
 			hw->mm_blk_handle = NULL;
+			if (hw->run_flag)
+				usleep_range(1000, 2000);
+			decoder_bmmu_box_free(bmmu_box_tmp);
+			bmmu_box_tmp = NULL;
 		}
 		if (vdec->parallel_dec == 1)
 			vdec_core_release(hw_to_vdec(hw), CORE_MASK_VDEC_1);
@@ -4384,8 +4459,8 @@ error1:
 		}
 	#ifdef ENABLE_USER_DATA
 		if (hw->user_data_buffer != NULL) {
-			dma_free_coherent(
-				amports_get_dma_device(),
+			decoder_dma_free_coherent(
+				hw->user_data_handle,
 				USER_DATA_SIZE,
 				hw->user_data_buffer,
 				hw->user_data_buffer_phys);
@@ -4394,12 +4469,12 @@ error1:
 		}
 	#endif
 
-		if (hw->lmem_addr) {
-			dma_free_coherent(amports_get_dma_device(),
-						LMEM_BUF_SIZE, (void *)hw->lmem_addr,
-						hw->lmem_phy_addr);
-			hw->lmem_addr = 0;
-		}
+	if (hw->lmem_addr) {
+		decoder_dma_free_coherent(hw->lmem_phy_handle,
+					LMEM_BUF_SIZE, (void *)hw->lmem_addr,
+					hw->lmem_phy_addr);
+		hw->lmem_addr = 0;
+	}
 
 		if (hw->fw) {
 			vfree(hw->fw);
@@ -4791,9 +4866,9 @@ static int ammvdec_avs_probe2(struct platform_device *pdev)
 #ifdef ENABLE_USER_DATA
 	if (NULL == hw->user_data_buffer) {
 		hw->user_data_buffer =
-			dma_alloc_coherent(amports_get_dma_device(),
+			decoder_dma_alloc_coherent(&hw->user_data_handle,
 				USER_DATA_SIZE,
-				&hw->user_data_buffer_phys, GFP_KERNEL);
+				&hw->user_data_buffer_phys, "AVS_AUX_BUF");
 		if (!hw->user_data_buffer) {
 			pr_info("%s: Can not allocate hw->user_data_buffer\n",
 				   __func__);
@@ -4922,7 +4997,7 @@ static int ammvdec_avs_remove2(struct platform_device *pdev)
 
 #ifdef BITSTREAM_READ_TMP_NO_CACHE
 		if (bitstream_read_tmp) {
-			dma_free_coherent(amports_get_dma_device(),
+			decoder_dma_free_coherent(bitstream_read_handle,
 				SVA_STREAM_BUF_SIZE, bitstream_read_tmp,
 				bitstream_read_tmp_phy);
 			bitstream_read_tmp = NULL;
@@ -4946,8 +5021,8 @@ static int ammvdec_avs_remove2(struct platform_device *pdev)
 
 #ifdef ENABLE_USER_DATA
 	if (hw->user_data_buffer != NULL) {
-		dma_free_coherent(
-			amports_get_dma_device(),
+		decoder_dma_free_coherent(
+			hw->user_data_handle,
 			USER_DATA_SIZE,
 			hw->user_data_buffer,
 			hw->user_data_buffer_phys);

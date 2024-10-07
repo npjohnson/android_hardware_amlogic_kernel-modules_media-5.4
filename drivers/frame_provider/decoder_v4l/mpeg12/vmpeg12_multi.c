@@ -54,6 +54,7 @@
 #include "../../decoder/utils/vdec_v4l2_buffer_ops.h"
 #include "../../decoder/utils/config_parser.h"
 #include "../../decoder/utils/vdec_feature.h"
+#include "../../decoder/utils/decoder_dma_alloc.h"
 
 #define MEM_NAME "codec_mmpeg12"
 #define CHECK_INTERVAL        (HZ/100)
@@ -96,7 +97,7 @@
 
 #define SEQINFO_EXT_AVAILABLE   0x80000000
 #define SEQINFO_PROG            0x00010000
-#define CCBUF_SIZE      (5*1024)
+#define CCBUF_SIZE      SEI_ITU_DATA_SIZE
 
 #define VF_POOL_SIZE        64
 #define DECODE_BUFFER_NUM_MAX 16
@@ -152,6 +153,8 @@ static unsigned int decode_timeout_val = 200;
 static u32 again_threshold;
 #endif
 
+static unsigned int frmbase_cont_bitlevel = 0x40;
+
 enum {
 	FRAME_REPEAT_TOP,
 	FRAME_REPEAT_BOT,
@@ -177,6 +180,9 @@ enum {
 #define DEC_RESULT_EOS 5
 #define DEC_RESULT_GET_DATA         6
 #define DEC_RESULT_GET_DATA_RETRY   7
+#define DEC_RESULT_UNFINISH         11
+#define DEC_RESULT_ERROR_DATA      	12
+
 
 #define DEC_DECODE_TIMEOUT         0x21
 #define DECODE_ID(hw) (hw_to_vdec(hw)->id)
@@ -273,6 +279,7 @@ struct vdec_mpeg12_hw_s {
 	dma_addr_t ccbuf_phyAddress;
 	void *ccbuf_phyAddress_virt;
 	u32 cc_buf_size;
+	ulong cc_buf_handle;
 	unsigned long ccbuf_phyAddress_is_remaped_nocache;
 	u32 frame_rpt_state;
 	/* for error handling */
@@ -347,6 +354,10 @@ struct vdec_mpeg12_hw_s {
 	u64 first_field_timestamp;
 	u64 first_field_timestamp_valid;
 	u32 report_field;
+	bool process_busy;
+	u32 chunk_size;
+	u32 chunk_offset;
+	u32 consume_byte;
 };
 static void vmpeg12_local_init(struct vdec_mpeg12_hw_s *hw);
 static int vmpeg12_hw_ctx_restore(struct vdec_mpeg12_hw_s *hw);
@@ -1870,7 +1881,7 @@ void cal_chunk_offset_and_size(struct vdec_mpeg12_hw_s *hw)
 	}
 }
 
-static irqreturn_t vmpeg12_isr_thread_fn(struct vdec_s *vdec, int irq)
+static irqreturn_t vmpeg12_isr_thread_handler(struct vdec_s *vdec, int irq)
 {
 	u32 reg, index, info, seqinfo, offset, pts, frame_size=0, tmp_h, tmp_w;
 	u64 pts_us64 = 0;
@@ -1904,6 +1915,16 @@ static irqreturn_t vmpeg12_isr_thread_fn(struct vdec_s *vdec, int irq)
 			debug_print(DECODE_ID(hw), PRINT_FLAG_DEC_DETAIL,
 				"[vdec_kpi][%s] First I frame coming.\n",
 				__func__);
+		}
+
+		if (input_frame_based(vdec)) {
+			if ((frame_width <= 0) || (frame_height <= 0)) {
+				debug_print(DECODE_ID(hw), 0,
+					"is_oversize w:%d h:%d\n", frame_width, frame_height);
+				hw->dec_result = DEC_RESULT_ERROR_DATA;
+				vdec_schedule_work(&hw->work);
+				return IRQ_HANDLED;
+			}
 		}
 
 		if (!v4l_res_change(hw, frame_width, frame_height, frame_prog)) {
@@ -1988,6 +2009,14 @@ static irqreturn_t vmpeg12_isr_thread_fn(struct vdec_s *vdec, int irq)
 		}
 		return IRQ_HANDLED;
 	} else {  /* MPEG12_PIC_DONE, MPEG12_SEQ_END */
+		debug_print(DECODE_ID(hw), PRINT_FLAG_DEC_DETAIL,
+			"%s, level %x, wp %x, rp %x, cnt %x\n",
+			__func__,
+			READ_VREG(VLD_MEM_VIFIFO_LEVEL),
+			READ_VREG(VLD_MEM_VIFIFO_WP),
+			READ_VREG(VLD_MEM_VIFIFO_RP),
+			READ_VREG(VIFF_BIT_CNT));
+
 		reset_process_time(hw);
 
 		info = READ_VREG(MREG_PIC_INFO);
@@ -2016,6 +2045,41 @@ static irqreturn_t vmpeg12_isr_thread_fn(struct vdec_s *vdec, int irq)
 		hw->dec_num++;
 		hw->dec_result = DEC_RESULT_DONE;
 		new_pic = &hw->pics[index];
+
+		// one packet multi frames
+		if (input_frame_based(vdec) &&
+			frmbase_cont_bitlevel != 0 &&
+			READ_VREG(VIFF_BIT_CNT) > frmbase_cont_bitlevel) {
+
+			u32 consume_byte, res_byte, bitcnt;
+
+			bitcnt = READ_VREG(VIFF_BIT_CNT);
+			res_byte = bitcnt >> 3;
+			consume_byte = hw->chunk_size - res_byte;
+
+			debug_print(DECODE_ID(hw), PRINT_FLAG_DEC_DETAIL,
+				"%s, size 0x%x, consume 0x%x, res 0x%x\n", __func__,
+				hw->chunk_size, consume_byte, res_byte);
+
+			if (consume_byte > VDEC_FIFO_ALIGN) {
+				consume_byte -= VDEC_FIFO_ALIGN;
+				res_byte += VDEC_FIFO_ALIGN;
+			}
+
+			debug_print(DECODE_ID(hw), PRINT_FLAG_DEC_DETAIL,
+				"%s, size 0x%x, consume 0x%x, res 0x%x, (consume_byte -= VDEC_FIFO_ALIGN)\n", __func__,
+				hw->chunk_size, consume_byte, res_byte);
+
+			consume_byte -= 0x80; //0x80, constant value, the count(0x25byte, 0x27byte, 0x29byte, 0x2abyte, 0x2bbyte) decoded in the next frame
+			res_byte += 0x80;
+			debug_print(DECODE_ID(hw), PRINT_FLAG_DEC_DETAIL,
+				"%s, size 0x%x, consume 0x%x, res 0x%x, (consume_byte -= 0x80)\n", __func__,
+				hw->chunk_size, consume_byte, res_byte);
+
+			hw->consume_byte = consume_byte;
+			hw->dec_result = DEC_RESULT_UNFINISH;
+		}
+
 		if (vdec->mvfrm) {
 			new_pic->frame_size = vdec->mvfrm->frame_size;
 			new_pic->hw_decode_time =
@@ -2144,14 +2208,35 @@ static irqreturn_t vmpeg12_isr_thread_fn(struct vdec_s *vdec, int irq)
 
 	return IRQ_HANDLED;
 }
+
+static irqreturn_t vmpeg12_isr_thread_fn(struct vdec_s *vdec, int irq)
+{
+	irqreturn_t ret;
+	struct vdec_mpeg12_hw_s *hw =
+		(struct vdec_mpeg12_hw_s *)(vdec->private);
+
+	ret = vmpeg12_isr_thread_handler(vdec, irq);
+
+	hw->process_busy = false;
+
+	return ret;
+}
+
 static irqreturn_t vmpeg12_isr(struct vdec_s *vdec, int irq)
 {
 	u32 info, offset;
 	struct vdec_mpeg12_hw_s *hw =
-	(struct vdec_mpeg12_hw_s *)(vdec->private);
+		(struct vdec_mpeg12_hw_s *)(vdec->private);
 
 	if (hw->eos)
 		return IRQ_HANDLED;
+
+	if (hw->process_busy) {
+		pr_info("%s process_busy\n", __func__);
+		return IRQ_HANDLED;
+	}
+	hw->process_busy = true;
+
 	info = READ_VREG(MREG_PIC_INFO);
 	offset = READ_VREG(MREG_FRAME_OFFSET);
 
@@ -2341,11 +2426,11 @@ static void vmpeg12_work_implement(struct vdec_mpeg12_hw_s *hw,
 
 		hw->input_empty = 0;
 		if (vdec_frame_based(vdec) && (hw->chunk != NULL)) {
-			r = hw->chunk->size +
-				(hw->chunk->offset & (VDEC_FIFO_ALIGN - 1));
+			r = hw->chunk_size +
+				(hw->chunk_offset & (VDEC_FIFO_ALIGN - 1));
 			WRITE_VREG(VIFF_BIT_CNT, r * 8);
 			if (vdec->mvfrm)
-				vdec->mvfrm->frame_size += hw->chunk->size;
+				vdec->mvfrm->frame_size += hw->chunk_size;
 		}
 		debug_print(DECODE_ID(hw), PRINT_FLAG_VDEC_STATUS,
 			"%s: %x %x %x size %d, bitcnt %d\n",
@@ -2390,6 +2475,15 @@ static void vmpeg12_work_implement(struct vdec_mpeg12_hw_s *hw,
 		debug_print(DECODE_ID(hw), 0,
 			"%s: end of stream, num %d(%d)\n",
 			__func__, hw->disp_num, hw->dec_num);
+	} else if (hw->dec_result == DEC_RESULT_ERROR_DATA) {
+		vdec_vframe_dirty(vdec, hw->chunk);
+		hw->chunk = NULL;
+		hw->chunk_header_offset = 0;
+		hw->chunk_res_size = 0;
+	} else if (hw->dec_result == DEC_RESULT_UNFINISH) {
+		debug_print(DECODE_ID(hw), PRINT_FLAG_DEC_DETAIL,
+			"%s, DEC_RESULT_UNFINISH\n", __func__);
+		amvdec_stop();
 	}
 	if (hw->stat & STAT_VDEC_RUN) {
 		amvdec_stop();
@@ -2637,9 +2731,9 @@ static void vmpeg12_workspace_init(struct vdec_mpeg12_hw_s *hw)
 	if (!hw->ccbuf_phyAddress_virt) {
 		hw->cc_buf_size = AUX_BUF_ALIGN(CCBUF_SIZE);
 		hw->ccbuf_phyAddress_virt =
-			dma_alloc_coherent(amports_get_dma_device(),
+			decoder_dma_alloc_coherent(&hw->cc_buf_handle,
 					  hw->cc_buf_size, &hw->ccbuf_phyAddress,
-					  GFP_KERNEL);
+					  "MPEG2_AUX_BUF");
 		if (hw->ccbuf_phyAddress_virt == NULL) {
 			vdec_v4l_post_error_event(ctx, DECODER_ERROR_ALLOC_BUFFER_FAIL);
 			pr_err("%s: failed to alloc cc buffer\n", __func__);
@@ -2778,6 +2872,11 @@ static void timeout_process(struct vdec_mpeg12_hw_s *hw)
 {
 	struct vdec_s *vdec = hw_to_vdec(hw);
 	struct aml_vcodec_ctx *ctx = hw->v4l2_ctx;
+
+	if (hw->process_busy) {
+		pr_info("%s, process busy\n", __func__);
+		return;
+	}
 
 	if (work_pending(&hw->work) ||
 	    work_busy(&hw->work) ||
@@ -3049,6 +3148,7 @@ static void vmpeg12_local_init(struct vdec_mpeg12_hw_s *hw)
 	atomic_set(&hw->put_num, 0);
 	atomic_set(&hw->get_num, 0);
 	atomic_set(&hw->peek_num, 0);
+	hw->process_busy = false;
 
 	if (dec_control)
 		hw->dec_control = dec_control;
@@ -3257,7 +3357,6 @@ static int check_dirty_data(struct vdec_s *vdec)
 	return 0;
 }
 
-
 static void run(struct vdec_s *vdec, unsigned long mask,
 void (*callback)(struct vdec_s *, void *),
 		void *arg)
@@ -3312,16 +3411,47 @@ void (*callback)(struct vdec_s *, void *),
 		hw->chunk_res_size = 0;
 		debug_print(DECODE_ID(hw), 0, "Multiple heads are parsed in a chunk and resolution changed.\n");
 	}
+	if ((vdec_frame_based(vdec)) &&
+		(hw->dec_result == DEC_RESULT_UNFINISH)) {
+		u32 data_invalid = 0;
+		u32 reserved = hw->chunk_size - hw->consume_byte;
+		debug_print(DECODE_ID(hw), PRINT_FLAG_DEC_DETAIL,
+			"%s: DEC_RESULT_UNFINISH, before, chunk_offset:0x%x, chunk_size:0x%x\n",
+			__func__,
+			hw->chunk_offset,
+			hw->chunk_size);
 
-	size = vdec_prepare_input(vdec, &hw->chunk);
-	if (size < 0) {
-		hw->input_empty++;
-		hw->dec_result = DEC_RESULT_AGAIN;
+		data_invalid = vdec_offset_prepare_input(vdec, hw->consume_byte, hw->chunk_offset, hw->chunk_size);
+		hw->chunk_offset = (hw->chunk_offset + hw->consume_byte) - data_invalid;
+		hw->chunk_size = (hw->chunk_size - hw->consume_byte) + data_invalid;
+		size = hw->chunk_size;
+		WRITE_VREG(AV_SCRATCH_L, reserved*8);
 
 		debug_print(DECODE_ID(hw), PRINT_FLAG_DEC_DETAIL,
-			"vdec_prepare_input: Insufficient data\n");
-		vdec_schedule_work(&hw->work);
-		return;
+			"%s: DEC_RESULT_UNFINISH, after, chunk_offset:0x%x, chunk_size:0x%x, data_invalid:0x%x, hw->consume_byte:0x%x, reserved*8:0x%x\n",
+			__func__,
+			hw->chunk_offset,
+			hw->chunk_size,
+			data_invalid,
+			hw->consume_byte,
+			reserved*8);
+	} else {
+		size = vdec_prepare_input(vdec, &hw->chunk);
+		if (size < 0) {
+			hw->input_empty++;
+			hw->dec_result = DEC_RESULT_AGAIN;
+
+			debug_print(DECODE_ID(hw), PRINT_FLAG_DEC_DETAIL,
+				"vdec_prepare_input: Insufficient data\n");
+			vdec_schedule_work(&hw->work);
+			return;
+		}
+		if ((vdec_frame_based(vdec)) &&
+			(hw->chunk != NULL)) {
+			hw->chunk_offset = hw->chunk->offset;
+			hw->chunk_size = hw->chunk->size;
+		}
+		WRITE_VREG(AV_SCRATCH_L, 0);
 	}
 
 	ATRACE_COUNTER("V_ST_DEC-chunk_size", size);
@@ -3329,17 +3459,17 @@ void (*callback)(struct vdec_s *, void *),
 	hw->input_empty = 0;
 	if ((vdec_frame_based(vdec)) &&
 		(hw->chunk != NULL)) {
-		size = hw->chunk->size +
-			(hw->chunk->offset & (VDEC_FIFO_ALIGN - 1));
+		size = hw->chunk_size +
+			(hw->chunk_offset & (VDEC_FIFO_ALIGN - 1));
 		WRITE_VREG(VIFF_BIT_CNT, size * 8);
 		if (vdec->mvfrm)
-			vdec->mvfrm->frame_size = hw->chunk->size;
+			vdec->mvfrm->frame_size = hw->chunk_size;
 	}
 	if (vdec_frame_based(vdec) && !vdec_secure(vdec)) {
 		/* HW needs padding (NAL start) for frame ending */
 		char* tail = (char *)hw->chunk->block->start_virt;
 
-		tail += hw->chunk->offset + hw->chunk->size;
+		tail += hw->chunk_offset + hw->chunk_size;
 		tail[0] = 0;
 		tail[1] = 0;
 		tail[2] = 1;
@@ -3352,14 +3482,14 @@ void (*callback)(struct vdec_s *, void *),
 		if (hw->chunk)
 			debug_print(DECODE_ID(hw), PRINT_FLAG_RUN_FLOW,
 				"run: chunk offset 0x%x, size %d\n",
-				hw->chunk->offset, hw->chunk->size);
+				hw->chunk_offset, hw->chunk_size);
 
 		if (!hw->chunk->block->is_mapped)
 			data = codec_mm_vmap(hw->chunk->block->start +
-				hw->chunk->offset, size);
+				hw->chunk_offset, size);
 		else
 			data = ((u8 *)hw->chunk->block->start_virt) +
-				hw->chunk->offset;
+				hw->chunk_offset;
 
 		if (debug_enable & PRINT_FLAG_VDEC_STATUS
 			) {
@@ -3370,6 +3500,17 @@ void (*callback)(struct vdec_s *, void *),
 			data[4], data[5], data[size - 4],
 			data[size - 3],	data[size - 2],
 			data[size - 1]);
+		}
+		if (hw->dec_result == DEC_RESULT_UNFINISH) {
+			debug_print(DECODE_ID(hw), PRINT_FLAG_DEC_DETAIL,
+				"%s: DEC_RESULT_UNFINISH %x %x %x %x %x size 0x%x\n",
+				__func__,
+				READ_VREG(VLD_MEM_VIFIFO_LEVEL),
+				READ_VREG(VLD_MEM_VIFIFO_WP),
+				READ_VREG(VLD_MEM_VIFIFO_RP),
+				STBUF_READ(&vdec->vbuf, get_rp),
+				STBUF_READ(&vdec->vbuf, get_wp),
+				size);
 		}
 		if (debug_enable & PRINT_FRAMEBASE_DATA
 			) {
@@ -3453,10 +3594,10 @@ static void reset(struct vdec_s *vdec)
 		hw->stat &= ~STAT_VDEC_RUN;
 	}
 
-	flush_work(&hw->work);
-	flush_work(&hw->timeout_work);
-	flush_work(&hw->notify_work);
-	flush_work(&hw->userdata_push_work);
+	cancel_work_sync(&hw->work);
+	cancel_work_sync(&hw->timeout_work);
+	cancel_work_sync(&hw->notify_work);
+	cancel_work_sync(&hw->userdata_push_work);
 	reset_process_time(hw);
 
 	for (i = 0; i < hw->buf_num; i++) {
@@ -3706,7 +3847,7 @@ static int ammvdec_mpeg12_remove(struct platform_device *pdev)
 	}
 
 	if (hw->ccbuf_phyAddress_virt) {
-		dma_free_coherent(amports_get_dma_device(),hw->cc_buf_size,
+		decoder_dma_free_coherent(hw->cc_buf_handle,hw->cc_buf_size,
 			hw->ccbuf_phyAddress_virt, hw->ccbuf_phyAddress);
 		hw->ccbuf_phyAddress_virt = NULL;
 		hw->ccbuf_phyAddress = 0;

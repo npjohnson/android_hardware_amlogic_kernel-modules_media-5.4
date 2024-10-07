@@ -293,6 +293,7 @@ static void copy_v4l2_format_dimention(struct v4l2_pix_format_mplane *pix_mp,
 				       struct v4l2_pix_format *pix,
 				       struct aml_q_data *q_data,
 				       u32 type);
+static int init_mmu_bmmu_box(struct aml_vcodec_ctx *ctx, bool init_dw);
 
 static ulong aml_vcodec_ctx_lock(struct aml_vcodec_ctx *ctx)
 {
@@ -579,6 +580,9 @@ void aml_vdec_pic_info_update(struct aml_vcodec_ctx *ctx)
 			"Cannot get correct pic info\n");
 		return;
 	}
+
+	if (!ctx->bmmu_box_dw || !ctx->mmu_box_dw)
+		init_mmu_bmmu_box(ctx, true);
 
 	/*if ((ctx->last_decoded_picinfo.visible_width == ctx->picinfo.visible_width) ||
 	    (ctx->last_decoded_picinfo.visible_height == ctx->picinfo.visible_height))
@@ -1005,20 +1009,20 @@ static void update_vdec_buf_plane(struct aml_vcodec_ctx *ctx,
 		if (i == 0) {
 			//Y
 			if (vb->num_planes == 1) {
-				fb->m.mem[0].size	= ctx->picinfo.y_len_sz +
-					ctx->picinfo.c_len_sz;
-				fb->m.mem[0].offset = ctx->picinfo.y_len_sz;
+				fb->m.mem[0].size	= ctx->pinfo_record.y_len_sz +
+					ctx->pinfo_record.c_len_sz;
+				fb->m.mem[0].offset = ctx->pinfo_record.y_len_sz;
 			} else {
-				fb->m.mem[0].size	= ctx->picinfo.y_len_sz;
+				fb->m.mem[0].size	= ctx->pinfo_record.y_len_sz;
 				fb->m.mem[0].offset = 0;
 			}
 		} else {
 			if (vb->num_planes == 2) {
 				//UV
-				fb->m.mem[1].size	= ctx->picinfo.c_len_sz;
-				fb->m.mem[1].offset = ctx->picinfo.c_len_sz >> 1;
+				fb->m.mem[1].size	= ctx->pinfo_record.c_len_sz;
+				fb->m.mem[1].offset = ctx->pinfo_record.c_len_sz >> 1;
 			} else {
-				fb->m.mem[i].size  = ctx->picinfo.c_len_sz >> 1;
+				fb->m.mem[i].size  = ctx->pinfo_record.c_len_sz >> 1;
 				fb->m.mem[i].offset = 0;
 			}
 		}
@@ -1725,6 +1729,19 @@ out:
 	return;
 }
 
+void stop_pipeline(struct aml_vcodec_ctx *ctx)
+{
+	if (ctx->ge2d) {
+		aml_v4l2_ge2d_thread_stop(ctx->ge2d);
+		v4l_dbg(ctx, V4L_DEBUG_CODEC_PRINFO, "ge2d stop.\n");
+	}
+
+	if (ctx->vpp) {
+		aml_v4l2_vpp_thread_stop(ctx->vpp);
+		v4l_dbg(ctx, V4L_DEBUG_CODEC_PRINFO, "vpp stop\n");
+	}
+}
+
 void wait_vcodec_ending(struct aml_vcodec_ctx *ctx)
 {
 	/* disable queue output item to worker. */
@@ -1739,6 +1756,7 @@ void wait_vcodec_ending(struct aml_vcodec_ctx *ctx)
 	if (ctx->state > AML_STATE_INIT)
 		aml_vdec_reset(ctx);
 
+	stop_pipeline(ctx);
 	/* pause the job and clean trans status. */
 	while (ctx->m2m_ctx->job_flags & TRANS_RUNNING) {
 		v4l2_m2m_job_pause(ctx->dev->m2m_dev_dec, ctx->m2m_ctx);
@@ -2017,7 +2035,8 @@ static int vidioc_decoder_streamon(struct file *file, void *priv,
 			if (ctx->vpp_cfg.fmt == 0)
 				ctx->vpp_cfg.fmt = ctx->cap_pix_fmt;
 
-			if (ctx->vpp == NULL)
+			if (ctx->vpp == NULL &&
+				vdec_get_instance_num() <= max_di_instance)
 				aml_wait_resource(ctx);
 
 			if ((atomic_read(&ctx->dev->vpp_count) < max_di_instance) ||
@@ -2164,6 +2183,8 @@ static int vidioc_decoder_reqbufs(struct file *file, void *priv,
 					ctx->vpp_size);
 			//rb->count = ctx->dpb_size;
 		}
+		ctx->v4l_reqbuff_flag = true;
+		ctx->pinfo_record = ctx->picinfo;
 		ctx->capture_memory_mode = rb->memory;
 		v4l_dbg(ctx, V4L_DEBUG_CODEC_OUTPUT,
 			"capture buffer memory mode is %d\n", rb->memory);
@@ -2805,6 +2826,15 @@ static int vidioc_vdec_s_fmt(struct file *file, void *priv,
 	q_data->fmt = fmt;
 	vidioc_try_fmt(f, q_data->fmt);
 
+	if (V4L2_TYPE_IS_OUTPUT(f->type) && ctx->drv_handle && ctx->receive_cmd_stop) {
+		ctx->state = AML_STATE_IDLE;
+		ATRACE_COUNTER("V_ST_VSINK-state", ctx->state);
+		v4l_dbg(ctx, V4L_DEBUG_CODEC_STATE,
+			"vcodec state (AML_STATE_IDLE)\n");
+		vdec_if_deinit(ctx);
+		ctx->receive_cmd_stop = 0;
+	}
+
 	if (f->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
 		q_data->sizeimage[0] = pix_mp->plane_fmt[0].sizeimage;
 		q_data->coded_width = pix_mp->width;
@@ -3192,104 +3222,123 @@ static int vb2ops_vdec_buf_prepare(struct vb2_buffer *vb)
 	return 0;
 }
 
-static int init_mmu_bmmu_box(struct aml_vcodec_ctx *ctx)
+static int init_mmu_bmmu_box(struct aml_vcodec_ctx *ctx, bool init_dw)
 {
 	int i;
 	int mmu_flag = ctx->is_drm_mode? CODEC_MM_FLAGS_TVP:0;
 	int bmmu_flag = mmu_flag;
 	u32 dw_mode = VDEC_DW_NO_AFBC;
 
-	ctx->comp_bufs = vzalloc(sizeof(*ctx->comp_bufs) * V4L_CAP_BUFF_MAX);
-	if (!ctx->comp_bufs)
-		return -ENOMEM;
+	if (!init_dw) {
+		ctx->comp_bufs = vzalloc(sizeof(*ctx->comp_bufs) * V4L_CAP_BUFF_MAX);
+		if (!ctx->comp_bufs)
+			return -ENOMEM;
 
-	if (vdec_if_get_param(ctx, GET_PARAM_DW_MODE, &dw_mode)) {
-		v4l_dbg(ctx, V4L_DEBUG_CODEC_ERROR, "invalid dw_mode\n");
-		return -EINVAL;
-	}
-
-	/* init bmmu box */
-	ctx->mmu_box = decoder_mmu_box_alloc_box("v4l2_dec",
-			ctx->id, V4L_CAP_BUFF_MAX,
-			ctx->comp_info.max_size * SZ_1M, mmu_flag);
-	if (!ctx->mmu_box) {
-		vfree(ctx->comp_bufs);
-		v4l_dbg(ctx, V4L_DEBUG_CODEC_ERROR, "fail to create mmu box\n");
-		return -EINVAL;
-	}
-
-	/* init mmu box */
-	bmmu_flag |= CODEC_MM_FLAGS_CMA_CLEAR | CODEC_MM_FLAGS_FOR_VDECODER;
-	ctx->bmmu_box  = decoder_bmmu_box_alloc_box("v4l2_dec",
-			ctx->id, V4L_CAP_BUFF_MAX,
-			4 + PAGE_SHIFT, bmmu_flag,
-			BMMU_ALLOC_FLAGS_WAIT);
-	if (!ctx->bmmu_box) {
-		v4l_dbg(ctx, V4L_DEBUG_CODEC_ERROR, "fail to create bmmu box\n");
-		goto free_mmubox;
-	}
-
-	if (dw_mode & 0x20) {
-		/* init mmu box dw*/
-		ctx->mmu_box_dw = decoder_mmu_box_alloc_box("v4l2_dec_dw",
+		/* init bmmu box */
+		ctx->mmu_box = decoder_mmu_box_alloc_box("v4l2_dec",
 				ctx->id, V4L_CAP_BUFF_MAX,
 				ctx->comp_info.max_size * SZ_1M, mmu_flag);
-		if (!ctx->mmu_box_dw) {
-			v4l_dbg(ctx, V4L_DEBUG_CODEC_ERROR, "fail to create mmu box dw\n");
-			goto free_bmmubox;
+		if (!ctx->mmu_box) {
+			v4l_dbg(ctx, V4L_DEBUG_CODEC_ERROR, "fail to create mmu box\n");
+			goto free_comp_bufs;
 		}
 
-		/* init bmmu box dw*/
+		/* init mmu box */
 		bmmu_flag |= CODEC_MM_FLAGS_CMA_CLEAR | CODEC_MM_FLAGS_FOR_VDECODER;
-		ctx->bmmu_box_dw  = decoder_bmmu_box_alloc_box("v4l2_dec_dw",
+		ctx->bmmu_box  = decoder_bmmu_box_alloc_box("v4l2_dec",
 				ctx->id, V4L_CAP_BUFF_MAX,
 				4 + PAGE_SHIFT, bmmu_flag,
 				BMMU_ALLOC_FLAGS_WAIT);
-		if (!ctx->bmmu_box_dw) {
-			v4l_dbg(ctx, V4L_DEBUG_CODEC_ERROR, "fail to create nmmu box dw\n");
-			goto free_mmubox_dw;
+		if (!ctx->bmmu_box) {
+			v4l_dbg(ctx, V4L_DEBUG_CODEC_ERROR, "fail to create bmmu box\n");
+			goto free_mmubox;
+		}
+
+		kref_init(&ctx->box_ref);
+		for (i = 0; i < V4L_CAP_BUFF_MAX; i++) {
+			struct internal_comp_buf *buf;
+			buf = &ctx->comp_bufs[i];
+			buf->index = i;
+			buf->ref = 0;
+			buf->box_ref = &ctx->box_ref;
+			buf->mmu_box = ctx->mmu_box;
+			buf->bmmu_box = ctx->bmmu_box;
+			buf->mmu_box_dw = ctx->mmu_box_dw;
+			buf->bmmu_box_dw = ctx->bmmu_box_dw;
+			buf->used = 0;
+		}
+		kref_get(&ctx->ctx_ref);
+		ctx->uvm_proxy = vzalloc(sizeof(*ctx->uvm_proxy) * V4L_CAP_BUFF_MAX);
+		if (!ctx->uvm_proxy)
+			goto free_bmmubox;
+		memset(ctx->uvm_proxy, 0, sizeof(*ctx->uvm_proxy) * V4L_CAP_BUFF_MAX);
+
+		v4l_dbg(ctx, V4L_DEBUG_CODEC_PRINFO,
+			"box init, bmmu: %px, mmu: %px\n",
+			ctx->bmmu_box, ctx->mmu_box);
+	} else {
+		if (vdec_if_get_param(ctx, GET_PARAM_DW_MODE, &dw_mode)) {
+			v4l_dbg(ctx, V4L_DEBUG_CODEC_ERROR, "invalid dw_mode\n");
+			goto free_comp_bufs;
+		}
+		if (dw_mode & 0x20) {
+			/* init mmu box dw*/
+			ctx->mmu_box_dw = decoder_mmu_box_alloc_box("v4l2_dec_dw",
+					ctx->id, V4L_CAP_BUFF_MAX,
+					ctx->comp_info.max_size * SZ_1M, mmu_flag);
+			if (!ctx->mmu_box_dw) {
+				v4l_dbg(ctx, V4L_DEBUG_CODEC_ERROR, "fail to create mmu box dw\n");
+				goto free_bmmubox;
+			}
+
+			/* init bmmu box dw*/
+			bmmu_flag |= CODEC_MM_FLAGS_CMA_CLEAR | CODEC_MM_FLAGS_FOR_VDECODER;
+			ctx->bmmu_box_dw  = decoder_bmmu_box_alloc_box("v4l2_dec_dw",
+					ctx->id, V4L_CAP_BUFF_MAX,
+					4 + PAGE_SHIFT, bmmu_flag,
+					BMMU_ALLOC_FLAGS_WAIT);
+			if (!ctx->bmmu_box_dw) {
+				v4l_dbg(ctx, V4L_DEBUG_CODEC_ERROR, "fail to create nmmu box dw\n");
+				goto free_mmubox_dw;
+			}
+
+			for (i = 0; i < V4L_CAP_BUFF_MAX; i++) {
+				struct internal_comp_buf *buf;
+				buf = &ctx->comp_bufs[i];
+				buf->mmu_box_dw = ctx->mmu_box_dw;
+				buf->bmmu_box_dw = ctx->bmmu_box_dw;
+			}
+
+			v4l_dbg(ctx, V4L_DEBUG_CODEC_PRINFO,
+				"box init, mmu_dw: %px bmmu_dw: %px\n",
+				ctx->mmu_box_dw, ctx->bmmu_box_dw);
 		}
 	}
 
-	kref_init(&ctx->box_ref);
-	for (i = 0; i < V4L_CAP_BUFF_MAX; i++) {
-		struct internal_comp_buf *buf;
-		buf = &ctx->comp_bufs[i];
-		buf->index = i;
-		buf->ref = 0;
-		buf->box_ref = &ctx->box_ref;
-		buf->mmu_box = ctx->mmu_box;
-		buf->bmmu_box = ctx->bmmu_box;
-		buf->mmu_box_dw = ctx->mmu_box_dw;
-		buf->bmmu_box_dw = ctx->bmmu_box_dw;
-		buf->used = 0;
-	}
-	kref_get(&ctx->ctx_ref);
-
-	ctx->uvm_proxy = vzalloc(sizeof(*ctx->uvm_proxy) * V4L_CAP_BUFF_MAX);
-	if (!ctx->uvm_proxy)
-		goto free_mmubox;
-	memset(ctx->uvm_proxy, 0, sizeof(*ctx->uvm_proxy) * V4L_CAP_BUFF_MAX);
-
-	v4l_dbg(ctx, V4L_DEBUG_CODEC_PRINFO,
-		"box init, bmmu: %px, mmu: %px, mmu_dw: %px bmmu_dw: %px\n",
-		ctx->bmmu_box, ctx->mmu_box, ctx->mmu_box_dw, ctx->bmmu_box_dw);
-
 	return 0;
 free_mmubox_dw:
-	decoder_mmu_box_free(ctx->mmu_box_dw);
-	ctx->mmu_box_dw = NULL;
-
+	if (init_dw) {
+		decoder_mmu_box_free(ctx->mmu_box_dw);
+		ctx->mmu_box_dw = NULL;
+	}
 free_bmmubox:
-	decoder_bmmu_box_free(ctx->bmmu_box);
-	ctx->bmmu_box = NULL;
-
+	if (init_dw) {
+		decoder_bmmu_box_free(ctx->bmmu_box);
+		ctx->bmmu_box = NULL;
+	}
 free_mmubox:
-	vfree(ctx->comp_bufs);
-	decoder_mmu_box_free(ctx->mmu_box);
-	ctx->mmu_box = NULL;
+	if (!init_dw) {
+		decoder_mmu_box_free(ctx->mmu_box);
+		ctx->mmu_box = NULL;
+	}
+free_comp_bufs:
+	if (!init_dw) {
+		vfree(ctx->comp_bufs);
+		ctx->comp_bufs = NULL;
+	}
 	return -1;
 }
+
 
 void aml_alloc_buffer(struct aml_vcodec_ctx *ctx, int flag)
 {
@@ -3330,6 +3379,21 @@ void aml_alloc_buffer(struct aml_vcodec_ctx *ctx, int flag)
 			}
 		}
 	}
+
+	if (flag & HDR10P_TYPE) {
+		for (i = 0; i < V4L_CAP_BUFF_MAX; i++) {
+			ctx->aux_infos.bufs[i].hdr10p_buf = vzalloc(HDR10P_BUF_SIZE);
+			if (ctx->aux_infos.bufs[i].hdr10p_buf) {
+				v4l_dbg(ctx, V4L_DEBUG_CODEC_EXINFO,
+					"v4l2 alloc %dth hdr10p buffer:%px\n",
+					i, ctx->aux_infos.bufs[i].hdr10p_buf);
+			} else {
+				ctx->aux_infos.bufs[i].hdr10p_buf = NULL;
+				v4l_dbg(ctx, V4L_DEBUG_CODEC_ERROR,
+					"v4l2 alloc %dth hdr10p buffer fail\n", i);
+			}
+		}
+	}
 }
 
 void aml_free_buffer(struct aml_vcodec_ctx *ctx, int flag)
@@ -3360,6 +3424,18 @@ void aml_free_buffer(struct aml_vcodec_ctx *ctx, int flag)
 				ctx->aux_infos.bufs[i].sei_state = 0;
 				ctx->aux_infos.bufs[i].sei_size = 0;
 				ctx->aux_infos.bufs[i].sei_buf = NULL;
+			}
+		}
+	}
+
+	if (flag & HDR10P_TYPE) {
+		for (i = 0; i < V4L_CAP_BUFF_MAX; i++) {
+			if (ctx->aux_infos.bufs[i].hdr10p_buf != NULL) {
+				v4l_dbg(ctx, V4L_DEBUG_CODEC_EXINFO,
+					"v4l2 free %dth hdr10p buffer:%px\n",
+					i, ctx->aux_infos.bufs[i].hdr10p_buf);
+				vfree(ctx->aux_infos.bufs[i].hdr10p_buf);
+				ctx->aux_infos.bufs[i].hdr10p_buf = NULL;
 			}
 		}
 	}
@@ -3432,6 +3508,16 @@ void aml_bind_dv_buffer(struct aml_vcodec_ctx *ctx, char **comp_buf, char **md_b
 		*comp_buf = ctx->aux_infos.bufs[index].comp_buf;
 		*md_buf = ctx->aux_infos.bufs[index].md_buf;
 		ctx->aux_infos.dv_index = (index + 1) % V4L_CAP_BUFF_MAX;
+	}
+}
+
+void aml_bind_hdr10p_buffer(struct aml_vcodec_ctx *ctx, char **addr)
+{
+	int index = ctx->aux_infos.hdr10p_index;
+
+	if (ctx->aux_infos.bufs[index].hdr10p_buf != NULL) {
+		*addr = ctx->aux_infos.bufs[index].hdr10p_buf;
+		ctx->aux_infos.hdr10p_index = (index + 1) % V4L_CAP_BUFF_MAX;
 	}
 }
 
@@ -3524,6 +3610,20 @@ int aml_canvas_cache_init(struct aml_vcodec_dev *dev)
 	return 0;
 }
 
+void aml_v4l_vpp_release_early(struct aml_vcodec_ctx * ctx)
+{
+	if (ctx->vpp && !(ctx->vpp_cfg.enable_nr &&
+		atomic_read(&ctx->vpp->local_buf_out))) {
+		aml_v4l2_vpp_destroy(ctx->vpp);
+		atomic_dec(&ctx->dev->vpp_count);
+		ctx->vpp = NULL;
+
+		v4l_dbg(ctx, V4L_DEBUG_CODEC_PRINFO,
+			"vpp destroy inst count:%d.\n",
+			atomic_read(&ctx->dev->vpp_count));
+	}
+}
+
 void aml_v4l_ctx_release(struct kref *kref)
 {
 	struct aml_vcodec_ctx * ctx;
@@ -3533,6 +3633,7 @@ void aml_v4l_ctx_release(struct kref *kref)
 	if (ctx->vpp) {
 		aml_v4l2_vpp_destroy(ctx->vpp);
 		atomic_dec(&ctx->dev->vpp_count);
+		ctx->vpp = NULL;
 
 		v4l_dbg(ctx, V4L_DEBUG_CODEC_PRINFO,
 			"vpp destory inst count:%d.\n",
@@ -3550,8 +3651,7 @@ void aml_v4l_ctx_release(struct kref *kref)
 	aml_task_chain_remove(ctx);
 
 	vfree(ctx->meta_infos.meta_bufs);
-	ctx->aux_infos.free_buffer(ctx, SEI_TYPE | DV_TYPE);
-	ctx->aux_infos.free_buffer(ctx, 1);
+	ctx->aux_infos.free_buffer(ctx, SEI_TYPE | DV_TYPE | HDR10P_TYPE);
 
 	v4l_dbg(ctx, V4L_DEBUG_CODEC_PRINFO,
 		"v4ldec has been destroyed.\n");
@@ -3701,6 +3801,10 @@ static int update_comp_buffer_to_reuse(struct aml_vcodec_ctx *ctx,
 				return -ENOMEM;
 			}
 
+			ibuf->header_size = ctx->comp_info.header_size;
+		}
+
+		if (ctx->comp_info.header_size != ibuf->header_size_dw) {
 			if (dw_mode & 0x20) {
 				decoder_bmmu_box_free_idx(ctx->bmmu_box_dw, ibuf->index);
 				if (decoder_bmmu_box_alloc_buf_phy(ctx->bmmu_box_dw,
@@ -3712,8 +3816,9 @@ static int update_comp_buffer_to_reuse(struct aml_vcodec_ctx *ctx,
 					mutex_unlock(&ctx->comp_lock);
 					return -ENOMEM;
 				}
+
+				ibuf->header_size_dw = ctx->comp_info.header_size;
 			}
-			ibuf->header_size = ctx->comp_info.header_size;
 		}
 
 		ibuf->ref |= (1 << 8);
@@ -3748,9 +3853,12 @@ static int bind_comp_buffer_to_uvm(struct aml_vcodec_ctx *ctx,
 	}
 
 	if (!ctx->bmmu_box || !ctx->mmu_box)
-		if (init_mmu_bmmu_box(ctx))
+		if (init_mmu_bmmu_box(ctx, false))
 			return -EINVAL;
 
+	if (!ctx->bmmu_box_dw || !ctx->mmu_box_dw)
+		if (init_mmu_bmmu_box(ctx, true))
+			return -EINVAL;
 	ret = update_comp_buffer_to_reuse(ctx, buf);
 	if (ret < 0)
 		return ret;
@@ -4247,7 +4355,7 @@ static void vb2ops_vdec_buf_cleanup(struct vb2_buffer *vb)
 				buf->mem[i] = NULL;
 			}
 		}
-		if (ctx->output_thread_ready) {
+		if (ctx->output_thread_ready && ctx->is_stream_off) {
 			if (!is_fb_mapped(ctx, fb->m.mem[0].addr)) {
 				list_del(&fb->task->node);
 				task_chain_clean(fb->task);
@@ -4367,6 +4475,13 @@ static void vb2ops_vdec_stop_streaming(struct vb2_queue *q)
 		ctx->cap_pool.dec = 0;
 		ctx->cap_pool.vpp = 0;
 		ctx->cap_pool.ge2d = 0;
+	}
+	if (ctx->is_out_stream_off && ctx->is_stream_off) {
+		ctx->v4l_resolution_change = false;
+		ctx->reset_flag = V4L_RESET_MODE_NORMAL;
+		v4l_dbg(ctx, V4L_DEBUG_CODEC_PRINFO,
+			"seek force reset to drop es frames.\n");
+		aml_vdec_reset(ctx);
 	}
 }
 
@@ -4699,6 +4814,10 @@ static int vidioc_vdec_s_parm(struct file *file, void *fh,
 			if (check_dec_cfginfo(&in->cfg))
 				return -EINVAL;
 			dec->cfg = in->cfg;
+			if (!vdec_if_set_param(ctx, SET_PARAM_CFG_INFO, &dec->cfg) &&
+				!vdec_if_get_param(ctx, GET_PARAM_PIC_INFO, &ctx->picinfo)) {
+				update_ctx_dimension(ctx, dst_vq->type);
+			}
 		}
 		if (in->parms_status & V4L2_CONFIG_PARM_DECODE_PSINFO)
 			dec->ps = in->ps;

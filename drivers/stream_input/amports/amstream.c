@@ -55,12 +55,8 @@
 #endif
 #include "../amports/streambuf.h"
 #include "../amports/streambuf_reg.h"
-#include "../parser/tsdemux.h"
-#include "../parser/psparser.h"
-#include "../parser/esparser.h"
 #include "../../frame_provider/decoder/utils/vdec.h"
 #include "adec.h"
-#include "../parser/rmparser.h"
 #include "amports_priv.h"
 #include <linux/amlogic/media/utils/amports_config.h>
 #include <linux/amlogic/media/frame_sync/tsync_pcr.h>
@@ -82,6 +78,7 @@
 #include "../subtitle/subtitle.h"
 #include "stream_buffer_base.h"
 #include "../../frame_provider/decoder/utils/vdec_feature.h"
+#include "../parser/stream_parser.h"
 
 //#define G12A_BRINGUP_DEBUG
 
@@ -1503,10 +1500,10 @@ static unsigned int amstream_userdata_poll(struct file *file,
 	poll_wait(file, &userdata->userdata_wait, wait_table);
 	mutex_lock(&userdata->mutex);
 	for (i = 0; i < MAX_USERDATA_CHANNEL_NUM; i++) {
-		if (userdata->id[i] == userdata->video_id && userdata->ready_flag[i] == 1) {
+		if (userdata->ready_flag[i] == 1) {
 			fd_match = 1;
 			if (vdec_get_debug_flags() & 0x10000000)
-				pr_info("%s, success! id = %d\n", __func__, userdata->video_id);
+				pr_info("%s, success! id = %d\n", __func__, userdata->id[i]);
 			break;
 		}
 	}
@@ -2261,7 +2258,6 @@ static long amstream_ioctl_set(struct port_priv_s *priv, ulong arg)
 			if (userdata->used[i] == 0) {
 				userdata->id[i] = priv->vdec->video_id;
 				userdata->used[i] = 1;
-				userdata->video_id = priv->vdec->video_id;
 				userdata->set_id_flag = 1;
 				break;
 			}
@@ -2377,27 +2373,33 @@ static long amstream_ioctl_get_ex(struct port_priv_s *priv, ulong arg)
 			pr_err("no video\n");
 			return -EINVAL;
 		} else {
-			struct vdec_info vstatus;
+			struct vdec_info_statistic_s v_statistic;
 			struct am_ioctl_parm_ex *p = &parm;
 
-			memset(&vstatus, 0, sizeof(vstatus));
+			memset(&v_statistic, 0, sizeof(v_statistic));
 
 			mutex_lock(&priv->mutex);
-			if (vdec_status(priv->vdec, &vstatus) == -1) {
+			if (vdec_status(priv->vdec, &v_statistic) == -1) {
 				mutex_unlock(&priv->mutex);
 				return -ENODEV;
 			}
+
 			mutex_unlock(&priv->mutex);
 
-			p->vstatus.width = vstatus.frame_width;
-			p->vstatus.height = vstatus.frame_height;
-			p->vstatus.fps = vstatus.frame_rate;
-			p->vstatus.error_count = vstatus.error_count;
-			p->vstatus.status = vstatus.status;
+			p->vstatus.width = v_statistic.vstatus.frame_width;
+			p->vstatus.height = v_statistic.vstatus.frame_height;
+			p->vstatus.fps = v_statistic.vstatus.frame_rate;
+			p->vstatus.error_count = v_statistic.vstatus.error_count;
+			p->vstatus.status = v_statistic.vstatus.status;
 			p->vstatus.euAspectRatio =
 				get_normalized_aspect_ratio(
-					vstatus.ratio_control);
-
+					v_statistic.vstatus.ratio_control);
+			if (v_statistic.ext_info_valid == 1) {
+				p->vstatus.aspect_ratio.dar_height = v_statistic.aspect_ratio.dar_height;
+				p->vstatus.aspect_ratio.dar_width = v_statistic.aspect_ratio.dar_width;
+				p->vstatus.aspect_ratio.sar_height = v_statistic.aspect_ratio.sar_height;
+				p->vstatus.aspect_ratio.sar_width = v_statistic.aspect_ratio.sar_width;
+			}
 		}
 		break;
 	case AMSTREAM_GET_EX_ADECSTAT:
@@ -3017,27 +3019,27 @@ static long amstream_do_ioctl_old(struct port_priv_s *priv,
 		if ((this->type & PORT_TYPE_VIDEO) == 0)
 			return -EINVAL;
 		{
-			struct vdec_info vstatus;
+			struct vdec_info_statistic_s v_statistic;
 			struct am_io_param para;
 			struct am_io_param *p = &para;
 
-			memset(&vstatus, 0, sizeof(vstatus));
+			memset(&v_statistic, 0, sizeof(v_statistic));
 
 			mutex_lock(&priv->mutex);
-			if (vdec_status(priv->vdec, &vstatus) == -1) {
+			if (vdec_status(priv->vdec, &v_statistic) == -1) {
 				mutex_unlock(&priv->mutex);
 				return -ENODEV;
 			}
 			mutex_unlock(&priv->mutex);
 
-			p->vstatus.width = vstatus.frame_width;
-			p->vstatus.height = vstatus.frame_height;
-			p->vstatus.fps = vstatus.frame_rate;
-			p->vstatus.error_count = vstatus.error_count;
-			p->vstatus.status = vstatus.status;
+			p->vstatus.width = v_statistic.vstatus.frame_width;
+			p->vstatus.height = v_statistic.vstatus.frame_height;
+			p->vstatus.fps = v_statistic.vstatus.frame_rate;
+			p->vstatus.error_count = v_statistic.vstatus.error_count;
+			p->vstatus.status = v_statistic.vstatus.status;
 			p->vstatus.euAspectRatio =
 				get_normalized_aspect_ratio(
-					vstatus.ratio_control);
+					v_statistic.vstatus.ratio_control);
 
 			if (copy_to_user((void *)arg, p, sizeof(para)))
 				r = -EFAULT;
@@ -3048,19 +3050,19 @@ static long amstream_do_ioctl_old(struct port_priv_s *priv,
 		if ((this->type & PORT_TYPE_VIDEO) == 0)
 			return -EINVAL;
 		{
-			struct vdec_info vinfo;
+			struct vdec_info_statistic_s v_statistic;
 			struct am_io_info para;
 
 			memset(&para, 0x0, sizeof(struct am_io_info));
 
 			mutex_lock(&priv->mutex);
-			if (vdec_status(priv->vdec, &vinfo) == -1) {
+			if (vdec_status(priv->vdec, &v_statistic) == -1) {
 				mutex_unlock(&priv->mutex);
 				return -ENODEV;
 			}
 			mutex_unlock(&priv->mutex);
 
-			memcpy(&para.vinfo, &vinfo, sizeof(struct vdec_info));
+			memcpy(&para.vinfo, &v_statistic.vstatus, sizeof(struct vdec_info));
 			if (copy_to_user((void *)arg, &para, sizeof(para)))
 				r = -EFAULT;
 			return r;
@@ -3260,8 +3262,7 @@ static long amstream_do_ioctl_old(struct port_priv_s *priv,
 
 			mutex_lock(&userdata->mutex);
 			for (i = 0; i < MAX_USERDATA_CHANNEL_NUM; i++) {
-				if (userdata->video_id == userdata->id[i] &&
-					userdata->ready_flag[i] == 1) {
+				if (userdata->ready_flag[i] == 1) {
 					ready_vdec = userdata->id[i];
 					userdata->ready_flag[i] = 0;
 					ready_flag = 1;
@@ -3269,7 +3270,7 @@ static long amstream_do_ioctl_old(struct port_priv_s *priv,
 				}
 			}
 			if (!ready_flag) {
-				pr_info("instance %d not ready!\n", userdata->video_id);
+				pr_info("no instance ready!\n");
 				r = -EINVAL;
 			}
 			mutex_unlock(&userdata->mutex);

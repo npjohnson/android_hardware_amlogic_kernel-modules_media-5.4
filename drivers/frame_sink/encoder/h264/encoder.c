@@ -1547,12 +1547,7 @@ static s32 set_input_format(struct encode_wq_s *wq,
 		dump_raw_input(wq, request);
 
 	picsize_x = ((wq->pic.encoder_width + 15) >> 4) << 4;
-	if (request->scale_enable) {
-		picsize_y = ((wq->pic.encoder_height + 15) >> 4) << 4;
-	}
-	else {
-		picsize_y = wq->pic.encoder_height;
-	}
+	picsize_y = ((wq->pic.encoder_height + 15) >> 4) << 4;
 	oformat = 0;
 
 	if ((request->type == LOCAL_BUFF)
@@ -2795,7 +2790,7 @@ s32 amvenc_loadmc(const char *p, struct encode_wq_s *wq)
 {
 	ulong timeout;
 	s32 ret = 0;
-    if (get_cpu_major_id() >= AM_MESON_CPU_MAJOR_ID_T7) {
+    if (get_cpu_major_id() >= AM_MESON_CPU_MAJOR_ID_SC2) {
         char *buf = vmalloc(0x1000 * 16);
         int ret = -1;
         pr_err("load firmware for t3 avc encoder\n");

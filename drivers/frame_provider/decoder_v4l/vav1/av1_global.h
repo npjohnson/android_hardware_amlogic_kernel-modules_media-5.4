@@ -1333,6 +1333,9 @@ typedef struct PIC_BUFFER_CONFIG_s {
   u32 hw_decode_time;
   u32 frame_size2; // For frame base mode
   int ctx_buf_idx;
+  int v4l_buf_index;
+  int repeat_count;
+  struct PIC_BUFFER_CONFIG_s *repeat_pic;
 } PIC_BUFFER_CONFIG;
 
 /*
@@ -2294,6 +2297,8 @@ RefCntBuffer *av1_get_primary_ref_frame_buf(
 void av1_raw_write_image(AV1Decoder *pbi, PIC_BUFFER_CONFIG *sd);
 
 int get_free_frame_buffer(struct AV1_Common_s *cm);
+
+int check_buff_has_show(struct RefCntBuffer_s *frame_buf);
 
 void av1_bufmgr_ctx_reset(AV1Decoder *pbi, BufferPool *const pool, AV1_COMMON *cm);
 

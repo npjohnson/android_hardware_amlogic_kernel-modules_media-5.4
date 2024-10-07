@@ -164,6 +164,8 @@ enum e_trace_work_status {
 #define CORE_MASK_COMBINE (1UL << 31)
 
 #define META_DATA_SIZE	(256)
+#define HDR10P_BUF_SIZE	(128)
+#define SEI_ITU_DATA_SIZE		(5*1024)
 
 #define SEI_TYPE	(1)
 #define DV_TYPE		(2)
@@ -287,6 +289,13 @@ struct vdec_data_s {
 	void *private_data;
 	atomic_t  use_count;
 	char *user_data_buf;
+	char *hdr10p_data_buf;
+	/* alloc_flag:
+	 * 0, none allocated
+	 * 1, allocated, used
+	 * 2, allocated, free
+	 */
+	u32 alloc_flag;
 };
 
 struct vdec_data_info_s {
@@ -299,6 +308,12 @@ struct vdec_data_info_s {
 struct vdec_data_core_s {
 	struct vdec_data_info_s vdata[VDEC_DATA_MAX_INSTANCE_NUM];
 	spinlock_t vdec_data_lock;
+};
+
+struct vdec_info_statistic_s {
+	struct vdec_info vstatus;
+	struct aspect_ratio_info aspect_ratio;
+	int ext_info_valid;
 };
 
 struct vdec_s {
@@ -426,7 +441,7 @@ struct vdec_s {
 	int pts_server_id;
 	u32 afd_video_id;
 	pfun_ptsserver_peek_pts_offset ptsserver_peek_pts_offset;
-	u32 play_num;
+	u32 inst_cnt;
 	wait_queue_head_t idle_wait;
 	struct vdec_data_info_s *vdata;
 };
@@ -488,7 +503,6 @@ struct vdec_post_task_parms_s {
 typedef struct {
 	struct mutex mutex;
 	wait_queue_head_t userdata_wait;
-	u32 video_id;
 	u32 set_id_flag;
 	u32 ready_flag[MAX_USERDATA_CHANNEL_NUM];
 	int used[MAX_USERDATA_CHANNEL_NUM];
@@ -576,6 +590,9 @@ extern void vdec_vframe_dirty(struct vdec_s *vdec,
 /* prepare decoder input */
 extern int vdec_prepare_input(struct vdec_s *vdec, struct vframe_chunk_s **p);
 
+extern u32 vdec_offset_prepare_input(struct vdec_s *vdec, u32 consume_byte,
+	u32 data_offset, u32 data_size);
+
 /* clean decoder input */
 extern void vdec_clean_input(struct vdec_s *vdec);
 
@@ -624,7 +641,7 @@ extern int vdec_init(struct vdec_s *vdec, int is_4k, bool is_v4l);
 
 extern void vdec_release(struct vdec_s *vdec);
 
-extern int vdec_status(struct vdec_s *vdec, struct vdec_info *vstatus);
+extern int vdec_status(struct vdec_s *vdec, struct vdec_info_statistic_s *vstat);
 
 extern int vdec_set_trickmode(struct vdec_s *vdec, unsigned long trickmode);
 

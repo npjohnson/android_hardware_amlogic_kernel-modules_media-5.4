@@ -62,6 +62,7 @@
 #include "../../../common/chips/decoder_cpu_ver_info.h"
 #include "avs2_global.h"
 #include "vavs2.h"
+#include "../../decoder/utils/decoder_dma_alloc.h"
 
 #define MEM_NAME "codec_avs2"
 #define I_ONLY_SUPPORT
@@ -774,11 +775,16 @@ struct AVS2Decoder_s {
 	int last_height;
 	ulong fb_token;
 	bool high_bandwidth_flag;
+	ulong rpm_mem_handle;
+	ulong lmem_phy_handle;
+	ulong frame_mmu_map_handle;
+	ulong rdma_mem_handle;
+	ulong cuva_handle;
 };
 
 static int  compute_losless_comp_body_size(
 		struct AVS2Decoder_s *dec, int width, int height,
-		uint8_t is_bit_depth_10);
+		bool is_bit_depth_10);
 
 static int avs2_print(struct AVS2Decoder_s *dec,
 	int flag, const char *fmt, ...)
@@ -956,14 +962,14 @@ int avs2_alloc_mmu(
 	unsigned int *mmu_index_adr)
 {
 	int ret;
-	int bit_depth_10 = (bit_depth == AVS2_BITS_10);
+	bool is_bit_depth_10 = (bit_depth == AVS2_BITS_10);
 	int picture_size;
 	int cur_mmu_4k_number, max_frame_num;
 	struct internal_comp_buf *ibuf = index_to_icomp_buf(dec, cur_buf_idx);
 
 	picture_size = compute_losless_comp_body_size(
 		dec, pic_width, pic_height,
-		bit_depth_10);
+		is_bit_depth_10);
 	cur_mmu_4k_number = ((picture_size + (1 << 12) - 1) >> 12);
 	if (get_cpu_major_id() >= AM_MESON_CPU_MAJOR_ID_SM1)
 		max_frame_num = MAX_FRAME_8K_NUM;
@@ -1915,7 +1921,7 @@ static uint32_t get_mv_buf_size(struct AVS2Decoder_s *dec, int width, int height
 /*Losless compression body buffer size 4K per 64x32 (jt)*/
 static int  compute_losless_comp_body_size(struct AVS2Decoder_s *dec,
 	int width, int height,
-	uint8_t is_bit_depth_10)
+	bool is_bit_depth_10)
 {
 	int     width_x64;
 	int     height_x32;
@@ -3701,14 +3707,14 @@ static void avs2_local_uninit(struct AVS2Decoder_s *dec)
 	dec->rpm_ptr = NULL;
 	dec->lmem_ptr = NULL;
 	if (dec->rpm_addr) {
-		dma_free_coherent(amports_get_dma_device(),
+		decoder_dma_free_coherent(dec->rpm_mem_handle,
 						RPM_BUF_SIZE, dec->rpm_addr,
 						dec->rpm_phy_addr);
 		dec->rpm_addr = NULL;
 	}
 
 	if (dec->cuva_addr) {
-		dma_free_coherent(amports_get_dma_device(),
+		decoder_dma_free_coherent(dec->cuva_handle,
 				dec->cuva_size, dec->cuva_addr,
 					dec->cuva_phy_addr);
 		dec->cuva_addr = NULL;
@@ -3716,7 +3722,7 @@ static void avs2_local_uninit(struct AVS2Decoder_s *dec)
 
 	if (dec->lmem_addr) {
 			if (dec->lmem_phy_addr)
-				dma_free_coherent(amports_get_dma_device(),
+				decoder_dma_free_coherent(dec->lmem_phy_handle,
 						LMEM_BUF_SIZE, dec->lmem_addr,
 						dec->lmem_phy_addr);
 		dec->lmem_addr = NULL;
@@ -3725,7 +3731,7 @@ static void avs2_local_uninit(struct AVS2Decoder_s *dec)
 #ifdef AVS2_10B_MMU
 	if (dec->frame_mmu_map_addr) {
 		if (dec->frame_mmu_map_phy_addr)
-			dma_free_coherent(amports_get_dma_device(),
+			decoder_dma_free_coherent(dec->frame_mmu_map_handle,
 				get_frame_mmu_map_size(dec), dec->frame_mmu_map_addr,
 					dec->frame_mmu_map_phy_addr);
 		dec->frame_mmu_map_addr = NULL;
@@ -3817,9 +3823,9 @@ static int avs2_local_init(struct AVS2Decoder_s *dec)
 			& 0x40) >> 6;
 
 	if ((debug & AVS2_DBG_SEND_PARAM_WITH_REG) == 0) {
-		dec->rpm_addr = dma_alloc_coherent(amports_get_dma_device(),
+		dec->rpm_addr = decoder_dma_alloc_coherent(&dec->rpm_mem_handle,
 			RPM_BUF_SIZE,
-			&dec->rpm_phy_addr, GFP_KERNEL);
+			&dec->rpm_phy_addr, "AVS2_RPM_BUF");
 		if (dec->rpm_addr == NULL) {
 			pr_err("%s: failed to alloc rpm buffer\n", __func__);
 			return -1;
@@ -3832,8 +3838,8 @@ static int avs2_local_init(struct AVS2Decoder_s *dec)
 	if (cuva_buf_size > 0) {
 		dec->cuva_size = AUX_BUF_ALIGN(cuva_buf_size);
 
-		dec->cuva_addr = dma_alloc_coherent(amports_get_dma_device(),
-				dec->cuva_size, &dec->cuva_phy_addr, GFP_KERNEL);
+		dec->cuva_addr = decoder_dma_alloc_coherent(&dec->cuva_handle,
+				dec->cuva_size, &dec->cuva_phy_addr, "AVS2_CUVA_BUF");
 	        avs2_print(dec, AVS2_DBG_BUFMGR,
 			"%s, cuva_size = %d cuva_phy_addr %x dec->cuva_addr = %px\n",
 			__func__, dec->cuva_size, (u32)dec->cuva_phy_addr, dec->cuva_addr);
@@ -3843,9 +3849,9 @@ static int avs2_local_init(struct AVS2Decoder_s *dec)
 		}
 	}
 
-	dec->lmem_addr = dma_alloc_coherent(amports_get_dma_device(),
+	dec->lmem_addr = decoder_dma_alloc_coherent(&dec->lmem_phy_handle,
 			LMEM_BUF_SIZE,
-			&dec->lmem_phy_addr, GFP_KERNEL);
+			&dec->lmem_phy_addr, "AVS2_LMEM_BUF");
 	if (dec->lmem_addr == NULL) {
 		pr_err("%s: failed to alloc lmem buffer\n", __func__);
 		return -1;
@@ -3857,9 +3863,9 @@ static int avs2_local_init(struct AVS2Decoder_s *dec)
 	dec->lmem_ptr = dec->lmem_addr;
 
 #ifdef AVS2_10B_MMU
-	dec->frame_mmu_map_addr = dma_alloc_coherent(amports_get_dma_device(),
+	dec->frame_mmu_map_addr = decoder_dma_alloc_coherent(&dec->frame_mmu_map_handle,
 				get_frame_mmu_map_size(dec),
-				&dec->frame_mmu_map_phy_addr, GFP_KERNEL);
+				&dec->frame_mmu_map_phy_addr, "AVS2_MMU_BUF");
 	if (dec->frame_mmu_map_addr == NULL) {
 		pr_err("%s: failed to alloc count_buffer\n", __func__);
 		return -1;
@@ -4045,8 +4051,8 @@ static struct avs2_frame_s *get_pic_by_index(
 		pic = dec->avs2_dec.m_bg;
 	else if (index >= 0	&& index < dec->used_buf_num) {
 		for (i = 0; i < dec->used_buf_num; i++) {
-			if (dec->avs2_dec.fref[i]->index == index)
-				pic = dec->avs2_dec.fref[i];
+			if (dec->avs2_dec.frm_pool[i].index == index)
+				pic = &dec->avs2_dec.frm_pool[i];
 		}
 	}
 	return pic;
@@ -4457,46 +4463,6 @@ static void set_vframe(struct AVS2Decoder_s *dec,
 #ifdef AVS2_10B_MMU
 		vf->type |= VIDTYPE_SCATTER;
 #endif
-	}
-
-	switch (pic->bit_depth) {
-	case AVS2_BITS_8:
-		vf->bitdepth = BITDEPTH_Y8 |
-			BITDEPTH_U8 | BITDEPTH_V8;
-		break;
-	case AVS2_BITS_10:
-	case AVS2_BITS_12:
-		vf->bitdepth = BITDEPTH_Y10 |
-			BITDEPTH_U10 | BITDEPTH_V10;
-		break;
-	default:
-		vf->bitdepth = BITDEPTH_Y10 |
-			BITDEPTH_U10 | BITDEPTH_V10;
-		break;
-	}
-	if ((vf->type & VIDTYPE_COMPRESS) == 0)
-		vf->bitdepth = BITDEPTH_Y8 | BITDEPTH_U8 | BITDEPTH_V8;
-	if (pic->bit_depth == AVS2_BITS_8)
-		vf->bitdepth |= BITDEPTH_SAVING_MODE;
-
-	set_frame_info(dec, vf);
-
-	vf->width = pic->pic_w /
-		get_double_write_ratio(pic->double_write_mode);
-	vf->height = pic->pic_h /
-		get_double_write_ratio(pic->double_write_mode);
-	if (force_w_h != 0) {
-		vf->width = (force_w_h >> 16) & 0xffff;
-		vf->height = force_w_h & 0xffff;
-	}
-	vf->compWidth = pic->pic_w;
-	vf->compHeight = pic->pic_h;
-	if (force_fps & 0x100) {
-		u32 rate = force_fps & 0xff;
-		if (rate)
-			vf->duration = 96000/rate;
-		else
-			vf->duration = 0;
 	}
 
 	switch (pic->bit_depth) {
@@ -5296,12 +5262,12 @@ static void get_picture_qos_info(struct AVS2Decoder_s *dec)
 }
 
 static int avs2_mmu_page_num(struct AVS2Decoder_s *dec,
-		int w, int h, int save_mode)
+		int w, int h, bool is_bit_depth_10)
 {
 	int picture_size;
 	int cur_mmu_4k_number, max_frame_num;
 
-	picture_size = compute_losless_comp_body_size(dec, w, h, save_mode);
+	picture_size = compute_losless_comp_body_size(dec, w, h, is_bit_depth_10);
 	cur_mmu_4k_number = ((picture_size + (PAGE_SIZE - 1)) >> PAGE_SHIFT);
 
 	if (get_cpu_major_id() >= AM_MESON_CPU_MAJOR_ID_SM1)
@@ -5343,7 +5309,7 @@ static void vavs2_get_comp_buf_info(struct AVS2Decoder_s *dec,
 	info->frame_buffer_size = avs2_mmu_page_num(
 		dec, dec->frame_width,
 		dec->frame_height,
-		bit_depth == 0);
+		bit_depth == AVS2_BITS_10);
 }
 
 static int vavs2_get_ps_info(struct AVS2Decoder_s *dec, struct aml_vdec_ps_infos *ps)
@@ -5360,7 +5326,6 @@ static int vavs2_get_ps_info(struct AVS2Decoder_s *dec, struct aml_vdec_ps_infos
 		u32 delta;
 		delta = ps->dpb_margin + ps->dpb_frames - max_buf_num;
 		ps->dpb_margin -= delta;
-		dec->dynamic_buf_margin = ps->dpb_margin;
 	}
 
 	ps->field = V4L2_FIELD_NONE;
@@ -5413,6 +5378,7 @@ static int v4l_res_change(struct AVS2Decoder_s *dec)
 	return ret;
 }
 
+int16_t get_param(uint16_t value, int8_t *print_info);
 
 static irqreturn_t vavs2_isr_thread_fn(int irq, void *data)
 {
@@ -5421,6 +5387,7 @@ static irqreturn_t vavs2_isr_thread_fn(int irq, void *data)
 	int i, ret;
 	int32_t start_code = 0;
 	struct aml_vcodec_ctx *ctx = dec->v4l2_ctx;
+	union param_u *rpm_param = &dec->avs2_dec.param;
 
 	avs2_print(dec, AVS2_DBG_BUFMGR_MORE,
 		"%s decode_status 0x%x process_state %d lcu 0x%x\n",
@@ -5450,6 +5417,9 @@ static irqreturn_t vavs2_isr_thread_fn(int irq, void *data)
 		goto irq_handled_exit;
 	} else if (dec_status == HEVC_DECPIC_DATA_DONE) {
 		PRINT_LINE();
+#ifdef AVS2_10B_MMU
+		avs2_recycle_mmu_buf_tail(dec);
+#endif
 		dec->start_decoding_flag |= 0x3;
 		if (dec->m_ins_flag) {
 			set_cuva_data(dec);
@@ -5528,12 +5498,8 @@ static irqreturn_t vavs2_isr_thread_fn(int irq, void *data)
 		PRINT_LINE();
 
 		if (dec->avs2_dec.hc.cur_pic != NULL) {
-			struct internal_comp_buf *ibuf =
-				index_to_icomp_buf(dec, dec->cur_fb_idx_mmu);
 			int32_t ii;
-#ifdef AVS2_10B_MMU
-			avs2_recycle_mmu_buf_tail(dec);
-#endif
+
 			check_pic_error(dec, dec->avs2_dec.hc.cur_pic);
 			avs2_post_process(&dec->avs2_dec);
 
@@ -5548,13 +5514,12 @@ static irqreturn_t vavs2_isr_thread_fn(int irq, void *data)
 					dec->avs2_dec.fref[ii];
 				if (pic->bg_flag == 0 &&
 					pic->is_output == -1 &&
-					dec->cur_fb_idx_mmu != INVALID_IDX &&
+					pic->index != INVALID_IDX &&
 					pic->vf_ref == 0) {
 					if (pic->refered_by_others == 0) {
 						int ret = 99;
 #ifdef AVS2_10B_MMU
-						dec->cur_fb_idx_mmu = INVALID_IDX;
-
+						struct internal_comp_buf *ibuf = index_to_icomp_buf(dec, pic->index);
 						decoder_mmu_box_free_idx(ibuf->mmu_box,
 								ibuf->index);
 
@@ -5745,6 +5710,15 @@ static irqreturn_t vavs2_isr_thread_fn(int irq, void *data)
 
 		dec->frame_width = dec->avs2_dec.param.p.horizontal_size;
 		dec->frame_height = dec->avs2_dec.param.p.vertical_size;
+		dec->avs2_dec.input.profile_id = get_param(rpm_param->p.profile_id, "profile_id");
+		dec->avs2_dec.input.sample_bit_depth = 8;
+		if (dec->avs2_dec.input.profile_id == BASELINE10_PROFILE) { /* 10bit profile (0x52)*/
+				dec->avs2_dec.input.sample_bit_depth =
+					get_param(rpm_param->p.encoding_precision,
+					"encoding_precision");
+				dec->avs2_dec.input.sample_bit_depth =
+					6 + (dec->avs2_dec.input.sample_bit_depth) * 2;
+			}
 		if (!v4l_res_change(dec)) {
 			if (ctx->param_sets_from_ucode && !dec->v4l_params_parsed) {
 				struct aml_vdec_ps_infos ps;
@@ -6691,10 +6665,6 @@ static void avs2_work(struct work_struct *work)
 		decode_frame_count[dec->index] = dec->frame_count;
 		ctx->decoder_status_info.decoder_count++;
 
-#ifdef AVS2_10B_MMU
-		dec->used_4k_num =
-			(READ_VREG(HEVC_SAO_MMU_STATUS) >> 16);
-#endif
 		avs2_print(dec, PRINT_FLAG_VDEC_STATUS,
 			"%s (===> %d) dec_result %d %x %x %x shiftbytes 0x%x decbytes 0x%x\n",
 			__func__,
@@ -7266,7 +7236,8 @@ static int ammvdec_avs2_probe(struct platform_device *pdev)
 	dec->m_ins_flag = 1;
 
 	if (is_rdma_enable()) {
-		dec->rdma_adr = dma_alloc_coherent(amports_get_dma_device(), RDMA_SIZE , &dec->rdma_phy_adr, GFP_KERNEL);
+		dec->rdma_adr = decoder_dma_alloc_coherent(&dec->rdma_mem_handle,
+							RDMA_SIZE , &dec->rdma_phy_adr, "AVS2_RDMA_BUF");
 		for (i = 0; i < SCALELUT_DATA_WRITE_NUM; i++) {
 			dec->rdma_adr[i * 4] = HEVC_IQIT_SCALELUT_WR_ADDR & 0xfff;
 			dec->rdma_adr[i * 4 + 1] = i;
@@ -7497,7 +7468,8 @@ static int ammvdec_avs2_remove(struct platform_device *pdev)
 		   dec->pts_missed, dec->pts_hit, dec->frame_dur);
 #endif
 	if (is_rdma_enable())
-		dma_free_coherent(amports_get_dma_device(), RDMA_SIZE, dec->rdma_adr, dec->rdma_phy_adr);
+		decoder_dma_free_coherent(dec->rdma_mem_handle,
+						RDMA_SIZE, dec->rdma_adr, dec->rdma_phy_adr);
 
 	vfree((void *)dec);
 	return 0;

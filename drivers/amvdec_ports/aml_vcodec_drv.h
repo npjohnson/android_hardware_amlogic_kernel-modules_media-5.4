@@ -432,6 +432,7 @@ struct internal_comp_buf {
 	void	*mmu_box_dw;
 	void	*bmmu_box_dw;
 	u32     used;
+	u32		header_size_dw;
 };
 
 /*
@@ -497,12 +498,14 @@ struct aux_data {
 	int		sei_state;
 	char*		comp_buf;
 	char*		md_buf;
+	char*		hdr10p_buf;
 };
 
 /*
  * struct aux_info - record aux data infos
  * @sei_index:		sei data index.
  * @dv_index:		dv data index.
+ * @hdr10p_index:	hdr10p data index.
  * @sei_need_free:	sei buffer need to free.
  * @bufs:		stores aux data.
  * @alloc_buffer:	alloc aux buffer functions.
@@ -510,10 +513,12 @@ struct aux_data {
  * @free_one_sei_buffer:free sei buffer with index functions.
  * @bind_sei_buffer:	bind sei buffer functions.
  * @bind_dv_buffer:	bind dv buffer functions.
+ * @bind_hdr10p_buffer:	bind hdr10p buffer functions.
  */
 struct aux_info {
 	int	sei_index;
-	int 	dv_index;
+	int	dv_index;
+	int	hdr10p_index;
 	bool    sei_need_free;
 	struct aux_data bufs[V4L_CAP_BUFF_MAX];
 	void 	(*alloc_buffer)(struct aml_vcodec_ctx *ctx, int flag);
@@ -521,6 +526,7 @@ struct aux_info {
 	void 	(*free_one_sei_buffer)(struct aml_vcodec_ctx *ctx, char **addr, int *size, int idx);
 	void 	(*bind_sei_buffer)(struct aml_vcodec_ctx *ctx, char **addr, int *size, int *idx);
 	void	(*bind_dv_buffer)(struct aml_vcodec_ctx *ctx, char **comp_buf, char **md_buf);
+	void	(*bind_hdr10p_buffer)(struct aml_vcodec_ctx *ctx, char **addr);
 };
 
 /*
@@ -696,6 +702,7 @@ struct aml_vcodec_ctx {
 	bool				v4l_resolution_change;
 	struct completion		comp;
 	struct v4l2_config_parm		config;
+	struct vdec_pic_info		pinfo_record;
 	struct vdec_pic_info		picinfo;
 	struct vdec_pic_info		last_decoded_picinfo;
 	enum v4l2_colorspace		colorspace;
@@ -759,6 +766,7 @@ struct aml_vcodec_ctx {
 	void			*bmmu_box_dw;
 	void			*mmu_box_dw;
 	struct aml_decoder_status_info	decoder_status_info;
+	bool			v4l_reqbuff_flag;
 };
 
 /**
